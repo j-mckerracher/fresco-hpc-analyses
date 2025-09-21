@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fresco-failure-detector"
+version = "0.1.0"
+description = "Early Warning Failure Detection for FRESCO Dataset Processing"
+authors = [{name = "J. McKerra", email = "jmckerra@purdue.edu"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "pandas",
+    "numpy",
+    "pyarrow",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    "scipy",
+    "joblib",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+    "mypy",
+    "jupyter",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/fresco-failure-detector"
+Repository = "https://github.com/yourusername/fresco-failure-detector"
+
+[project.scripts]
+fresco-detector = "fresco_failure_detector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fresco_failure_detector*"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true

@@ -35,39 +35,63 @@ warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
+def _collect_all_job_ids(files):
+    ids = set()
+    for fp in tqdm(files, desc="Enumerating job IDs"):
+        try:
+            df = pd.read_parquet(fp, columns=['jid'])
+            if 'jid' in df.columns:
+                ids.update(df['jid'].dropna().unique())
+        except Exception:
+            continue
+    return ids
 
-def _process_and_aggregate_file(file_path, sampled_job_ids=None):
+def _sample_job_ids(files, sample_fraction, rng=42):
+    all_ids = _collect_all_job_ids(files)
+    n = int(len(all_ids) * sample_fraction)
+    rng = np.random.default_rng(rng)
+    return set(rng.choice(list(all_ids), size=n, replace=False))
+
+
+
+def _process_and_aggregate_file(file_with_sys, sampled_job_ids=None):
     """
     Process a single file and return aggregated job-level data.
     This function runs in a separate process for true parallelism.
 
     Args:
-        file_path (Path): Path to the parquet file
+        file_with_sys (tuple[Path,str] | Path): (parquet path, system label) or just a Path
         sampled_job_ids (set, optional): Set of job IDs to filter by
 
     Returns:
         pd.DataFrame or None: Aggregated job data or None if error/empty
     """
     try:
-        # Read the file
+        # Support both (Path, system_label) and Path
+        if isinstance(file_with_sys, tuple):
+            file_path, system_label = file_with_sys
+        else:
+            file_path, system_label = file_with_sys, None
+
         df = pd.read_parquet(file_path)
-
         if df.empty:
             return None
 
-        # Clean the dataframe
         df = _clean_dataframe(df)
-
         if df.empty:
             return None
 
-        # Apply sampling filter if provided
+        # Attach system label from filename-derived input
+        if system_label is not None:
+            df['system'] = system_label
+
+        # Apply job sampling if provided
         if sampled_job_ids and 'jid' in df.columns:
             df = df[df['jid'].isin(sampled_job_ids)]
             if df.empty:
                 return None
 
-        # Perform aggregation immediately in this process
+        # Aggregate to job-level right away
         job_aggregations = {
             'start_time': 'first',
             'end_time': 'first',
@@ -77,22 +101,26 @@ def _process_and_aggregate_file(file_path, sampled_job_ids=None):
             'ncores': 'first',
             'nhosts': 'first',
             'duration_hours': 'first',
-            'job_cpu_usage': ['mean', 'count'],  # Need count for weighted average later
-            'value_memused': ['mean', 'count']   # Need count for weighted average later
+            'job_cpu_usage': ['mean', 'count'],
+            'value_memused': ['mean', 'count'],
+            'system': 'first'  # keep the system label with the job
         }
 
         aggregated_df = df.groupby('jid').agg(job_aggregations)
 
         # Flatten multi-index columns
-        aggregated_df.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col
-                                for col in aggregated_df.columns.values]
+        aggregated_df.columns = [
+            '_'.join(col).strip() if isinstance(col, tuple) else col
+            for col in aggregated_df.columns.values
+        ]
         aggregated_df = aggregated_df.reset_index()
 
         return aggregated_df
 
     except Exception as e:
-        logger.warning(f"Could not process {file_path}: {e}")
+        logger.warning(f"Could not process {file_with_sys}: {e}")
         return None
+
 
 
 def _clean_dataframe(df):
@@ -109,29 +137,31 @@ def _clean_dataframe(df):
     if df.empty:
         return df
 
-    # Detect data format based on content
+    # Detect data format based on content (heuristic)
     is_2013_format = False
     if 'jobname' in df.columns and 'exitcode' in df.columns:
-        # Quick sample check for 2013 format
         jobname_sample = df['jobname'].dropna().head(5)
         exitcode_sample = df['exitcode'].dropna().head(5)
-
         if len(jobname_sample) > 0 and len(exitcode_sample) > 0:
-            # 2013 format: jobname has COMPLETED/FAILED, exitcode has {NODE...}
+            # 2013 format: jobname has COMPLETED/FAILED; exitcode looks like {NODE...}
             if any(str(val) in ['COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELLED'] for val in jobname_sample):
                 if any(str(val).startswith('{') for val in exitcode_sample):
                     is_2013_format = True
 
-    # Handle column mapping based on format
+    # Column mapping
     if is_2013_format:
+        # Exitcode / username
         if 'jobname' in df.columns:
             df['job_exitcode'] = df['jobname']
-        if 'host_list' in df.columns:
-            df['job_username'] = df['host_list']
         if 'username' in df.columns:
-            df['job_cpu_usage'] = pd.to_numeric(df['username'], errors='coerce')
+            df['job_username'] = df['username']
+
+        # CPU usage: pick a valid numeric column
+        cpu_cols = [c for c in ['value_cpuuser', 'cpu_user', 'cpu_user_pct'] if c in df.columns]
+        if cpu_cols:
+            df['job_cpu_usage'] = pd.to_numeric(df[cpu_cols[0]], errors='coerce')
     else:
-        # Newer data format (2023+)
+        # Newer (2023+) format
         if 'exitcode' in df.columns:
             df['job_exitcode'] = df['exitcode']
         if 'username' in df.columns:
@@ -139,42 +169,37 @@ def _clean_dataframe(df):
         if 'value_cpuuser' in df.columns:
             df['job_cpu_usage'] = pd.to_numeric(df['value_cpuuser'], errors='coerce')
 
-    # Check for required columns
-    required_columns = ['time', 'start_time', 'end_time', 'job_exitcode', 'queue',
-                       'job_username', 'job_cpu_usage', 'value_memused', 'ncores', 'nhosts', 'jid']
-
+    # Required columns
+    required_columns = [
+        'time', 'start_time', 'end_time', 'job_exitcode', 'queue',
+        'job_username', 'job_cpu_usage', 'value_memused', 'ncores', 'nhosts', 'jid'
+    ]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
-        return pd.DataFrame()  # Early return for missing columns
+        return pd.DataFrame()  # Early return if we can't proceed
 
-    # Convert data types efficiently
+    # Type conversions
     try:
-        # Convert datetime columns
         for col in ['time', 'start_time', 'end_time']:
             df[col] = pd.to_datetime(df[col])
-
-        # Convert numeric columns
-        numeric_columns = ['job_cpu_usage', 'value_memused', 'ncores', 'nhosts']
-        for col in numeric_columns:
+        for col in ['job_cpu_usage', 'value_memused', 'ncores', 'nhosts']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    except Exception as e:
-        logger.warning(f"Error converting data types: {e}")
+    except Exception:
         return pd.DataFrame()
 
-    # Calculate job duration
+    # Duration
     df['duration_seconds'] = (df['end_time'] - df['start_time']).dt.total_seconds()
     df['duration_hours'] = df['duration_seconds'] / 3600
 
-    # Filter out invalid jobs with vectorized operations
+    # Valid rows
     valid_mask = (
         (df['duration_seconds'] > 0) &
         (df['job_cpu_usage'].notna()) &
         (df['value_memused'].notna()) &
         (df['ncores'] > 0)
     )
-
     return df[valid_mask]
+
 
 
 class FrescoResourceWasteAnalyzer:
@@ -211,6 +236,75 @@ class FrescoResourceWasteAnalyzer:
         logger.info(f"Output directory: {self.output_dir}")
         logger.info(f"Process pool size configured to {self.num_workers}")
 
+    def _enumerate_job_ids_from_file(self, file_path):
+        """
+        Read a single Parquet file and return the set of unique job IDs it contains.
+        Reads only the 'jid' column for efficiency.
+        """
+        try:
+            df = pd.read_parquet(file_path, columns=['jid'])
+            if 'jid' not in df.columns or df.empty:
+                return set()
+            # Drop NA and convert to Python types to prevent dtype surprises
+            return set(df['jid'].dropna().astype(object).unique().tolist())
+        except Exception as e:
+            logger.warning(f"Failed to enumerate jids from {file_path}: {e}")
+            return set()
+
+    def _collect_all_job_ids_parallel(self, file_paths):
+        """
+        Collect the global set of unique job IDs across ALL files in parallel.
+        NOTE: This holds the set of unique jids in memory.
+        """
+        logger.info(f"Enumerating job IDs from {len(file_paths)} files (jid column only)...")
+        all_ids = set()
+        with ProcessPoolExecutor(max_workers=self.num_workers) as ex:
+            futures = {ex.submit(self._enumerate_job_ids_from_file, fp): fp for fp in file_paths}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating jids"):
+                try:
+                    part_ids = fut.result()
+                    if part_ids:
+                        all_ids.update(part_ids)
+                except Exception as e:
+                    logger.warning(f"Enumeration task failed: {e}")
+        logger.info(f"Enumerated {len(all_ids):,} unique job IDs")
+        return all_ids
+
+    def _sample_job_ids_srs(self, files_with_system, sample_fraction, random_state=42, min_samples=1):
+        """
+        True SRS of jobs:
+          1) Enumerate ALL unique job IDs across the provided files.
+          2) Draw an exact simple random sample of size floor(fraction * N).
+
+        Args:
+            files_with_system (list[tuple[Path,str]]): (file, system) tuples
+            sample_fraction (float): 0 < fraction <= 1
+            random_state (int): RNG seed
+            min_samples (int): lower bound to avoid empty samples in tiny tests
+
+        Returns:
+            set: sampled job IDs
+        """
+        assert 0 < sample_fraction <= 1.0, "sample_fraction must be in (0, 1]"
+        file_paths = [fp for (fp, _sys) in files_with_system]
+        all_ids = self._collect_all_job_ids_parallel(file_paths)
+        N = len(all_ids)
+        if N == 0:
+            logger.warning("No job IDs found during enumeration; returning empty sample.")
+            return set()
+
+        k = max(int(np.floor(sample_fraction * N)), min_samples)
+        if k >= N:
+            logger.info("Requested sample >= population size; taking all job IDs.")
+            return set(all_ids)
+
+        rng = np.random.default_rng(random_state)
+        # numpy choice on a list for reproducibility and speed
+        sampled = rng.choice(list(all_ids), size=k, replace=False)
+        sampled_set = set(sampled.tolist())
+        logger.info(f"SRS selected {len(sampled_set):,} jobs out of {N:,} ({sample_fraction:.1%})")
+        return sampled_set
+
     def discover_data_files(self, limit_years=None, limit_files_per_day=None, hpc_system=None):
         """
         Discover all parquet files in the data directory, optionally filtered by HPC system.
@@ -220,12 +314,12 @@ class FrescoResourceWasteAnalyzer:
             limit_files_per_day (int): Limit number of files per day for testing
             hpc_system (str): Filter by HPC system. Options:
                 - 'stampede': Files containing '_S' in filename
-                - 'conte': Files containing '_C' in filename
-                - 'anvil': Files without '_S' or '_C' in filename
+                - 'conte':    Files containing '_C' in filename
+                - 'anvil':    Files without '_S' or '_C' in filename
                 - 'all' or None: All files (no filtering)
 
         Returns:
-            list: List of file paths
+            list[tuple[Path,str]]: List of (file path, system label) tuples
         """
         logger.info(f"Discovering data files for HPC system: {hpc_system or 'all'}...")
         files = []
@@ -248,24 +342,27 @@ class FrescoResourceWasteAnalyzer:
 
                     day_files = list(day_dir.glob("*.parquet"))
 
-                    # Filter by HPC system if specified
+                    # Filter by HPC system (using filename)
                     if hpc_system:
-                        if hpc_system.lower() == 'stampede':
+                        hsys = hpc_system.lower()
+                        if hsys == 'stampede':
                             day_files = [f for f in day_files if '_S' in f.name]
-                        elif hpc_system.lower() == 'conte':
+                        elif hsys == 'conte':
                             day_files = [f for f in day_files if '_C' in f.name]
-                        elif hpc_system.lower() == 'anvil':
-                            day_files = [f for f in day_files if '_S' not in f.name and '_C' not in f.name]
-                        elif hpc_system.lower() == 'all':
-                            pass  # No filtering
+                        elif hsys == 'anvil':
+                            day_files = [f for f in day_files if ('_S' not in f.name and '_C' not in f.name)]
+                        elif hsys == 'all':
+                            pass  # keep all
                         else:
-                            logger.warning(
-                                f"Unknown HPC system '{hpc_system}'. Valid options: 'stampede', 'conte', 'anvil', 'all'")
-                            pass  # No filtering for unknown systems
+                            logger.warning(f"Unknown HPC system '{hpc_system}'. Valid: stampede|conte|anvil|all")
 
                     if limit_files_per_day:
                         day_files = day_files[:limit_files_per_day]
-                    files.extend(day_files)
+
+                    # Attach system label by filename
+                    for f in day_files:
+                        sys = 'stampede' if '_S' in f.name else ('conte' if '_C' in f.name else 'anvil')
+                        files.append((f, sys))
 
         logger.info(f"Discovered {len(files)} data files for HPC system: {hpc_system or 'all'}")
         return files
@@ -308,33 +405,26 @@ class FrescoResourceWasteAnalyzer:
     def load_and_process_parallel(self, files, sample_jobs_fraction=None):
         """
         Load and process files in parallel with early aggregation.
-        This replaces the old load_data_chunked method with a much faster approach.
-
         Args:
-            files (list): List of file paths to process
-            sample_jobs_fraction (float): Fraction of jobs to sample (for testing)
-
+            files (list[tuple[Path,str]]): (file, system) tuples from discover_data_files
+            sample_jobs_fraction (float): Fraction of jobs to sample (0<frac<=1)
         Returns:
             pd.DataFrame: Aggregated job-level data
         """
         logger.info(f"Processing {len(files)} files in parallel using {self.num_workers} workers...")
 
-        # Handle sampling if requested
         sampled_job_ids = None
         if sample_jobs_fraction and sample_jobs_fraction < 1.0:
-            sampled_job_ids = self._efficient_job_sampling(files, sample_jobs_fraction)
+            sampled_job_ids = self._sample_job_ids_srs(files, sample_jobs_fraction, random_state=42)
 
-        # Process files in parallel with early aggregation
         pre_aggregated_results = []
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from functools import partial
 
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            # Create partial function with sampled_job_ids
             process_func = partial(_process_and_aggregate_file, sampled_job_ids=sampled_job_ids)
+            future_to_file = {executor.submit(process_func, fws): fws for fws in files}
 
-            # Submit all tasks
-            future_to_file = {executor.submit(process_func, f): f for f in files}
-
-            # Collect results as they complete
             for future in tqdm(as_completed(future_to_file), total=len(files), desc="Processing files"):
                 try:
                     result = future.result()
@@ -344,54 +434,54 @@ class FrescoResourceWasteAnalyzer:
                     file_path = future_to_file[future]
                     logger.error(f"Process failed for {file_path}: {e}")
 
+        # Count successfully processed shards (post-filter)
         self.total_files_processed = len(pre_aggregated_results)
-
         if not pre_aggregated_results:
             raise ValueError("No data could be processed from the specified files")
 
-        logger.info(f"Successfully processed {len(pre_aggregated_results)} files")
+        logger.info(f"Successfully processed {self.total_files_processed} shard aggregates")
         logger.info("Combining pre-aggregated results...")
 
-        # Combine all pre-aggregated results
         combined_df = pd.concat(pre_aggregated_results, ignore_index=True)
-        gc.collect()  # Clean up memory
+        gc.collect()
 
-        # Final aggregation to handle jobs that span multiple files
         logger.info("Performing final aggregation for jobs spanning multiple files...")
 
         def weighted_mean(group, value_col, weight_col):
-            """Calculate weighted mean for a group"""
             weights = group[weight_col]
-            if weights.sum() == 0:
-                return 0
-            return (group[value_col] * weights).sum() / weights.sum()
+            denom = weights.sum()
+            if denom == 0:
+                return 0.0
+            return (group[value_col] * weights).sum() / denom
 
-        # Group by job ID and aggregate
+        # Final job-level aggregation across shards:
+        # Use min(start), max(end) and recompute duration; carry a single system label
         final_agg = combined_df.groupby('jid').apply(
             lambda g: pd.Series({
-                'start_time': g['start_time_first'].iloc[0],
-                'end_time': g['end_time_first'].iloc[0],
+                'start_time': g['start_time_first'].min(),
+                'end_time': g['end_time_first'].max(),
                 'job_exitcode': g['job_exitcode_first'].iloc[0],
                 'queue': g['queue_first'].iloc[0],
                 'job_username': g['job_username_first'].iloc[0],
                 'ncores': g['ncores_first'].iloc[0],
                 'nhosts': g['nhosts_first'].iloc[0],
-                'duration_hours': g['duration_hours_first'].iloc[0],
                 'job_cpu_usage': weighted_mean(g, 'job_cpu_usage_mean', 'job_cpu_usage_count'),
                 'value_memused': weighted_mean(g, 'value_memused_mean', 'value_memused_count'),
+                'system': g['system_first'].iloc[0]
             })
         ).reset_index()
+
+        # Recompute duration
+        final_agg['duration_hours'] = (final_agg['end_time'] - final_agg['start_time']).dt.total_seconds() / 3600.0
 
         self.total_jobs_processed = len(final_agg)
         logger.info(f"Final aggregated data contains {self.total_jobs_processed:,} unique jobs")
 
         return final_agg
 
-
     def calculate_resource_waste(self, job_df):
         """
         Calculate resource waste metrics on already-aggregated job data.
-        Enhanced version with system-specific memory calculations and statistical tests.
 
         Args:
             job_df (pd.DataFrame): Aggregated job-level data
@@ -400,53 +490,51 @@ class FrescoResourceWasteAnalyzer:
             pd.DataFrame: Job data with waste metrics added
         """
         logger.info("Calculating resource waste metrics...")
-
-        # The input is already aggregated, so we just calculate waste metrics
         job_df = job_df.copy()
 
-        # RQ2 Core Metric 1: CPU Waste
+        # CPU waste
         job_df['cpu_waste'] = 1.0 - (job_df['job_cpu_usage'] / 100.0)
         job_df['cpu_waste'] = job_df['cpu_waste'].clip(0, 1)
 
-        # RQ2 Core Metric 2: Memory Waste with system-specific calculations
-        # Extract system identifier from queue name or job ID
-        job_df['system'] = job_df['queue'].apply(lambda x:
-            'stampede' if '_S' in x else 'conte' if '_C' in x else 'anvil')
+        # Ensure system column exists; if not, fallback to queue-based inference
+        if 'system' not in job_df.columns:
+            job_df['system'] = job_df['queue'].apply(
+                lambda x: 'stampede' if '_S' in str(x) else ('conte' if '_C' in str(x) else 'anvil')
+            )
 
-        # System-specific memory per core (based on actual system specs)
+        # System-specific memory per core (GB)
         memory_per_core = {
-            'stampede': 2.0,  # 32GB per 16-core node
-            'conte': 4.0,     # 64GB per 16-core node
-            'anvil': 2.0      # 256GB per 128-core node
+            'stampede': 2.0,  # ~32GB / 16-core node
+            'conte': 4.0,  # ~64GB / 16-core node
+            'anvil': 2.0  # ~256GB / 128-core node
         }
 
         job_df['mem_per_core'] = job_df['system'].map(memory_per_core)
         job_df['estimated_requested_mem_gb'] = job_df['ncores'] * job_df['mem_per_core']
+
+        # Memory waste
         job_df['mem_waste'] = 1.0 - (job_df['value_memused'] / job_df['estimated_requested_mem_gb'])
         job_df['mem_waste'] = job_df['mem_waste'].clip(0, 1)
 
-        # RQ2 Severity Metric: Composite Waste Score (equal weighting based on analysis)
-        job_df['composite_waste'] = (0.5 * job_df['cpu_waste']) + (0.5 * job_df['mem_waste'])
+        # Composite waste (equal-weight)
+        job_df['composite_waste'] = 0.5 * job_df['cpu_waste'] + 0.5 * job_df['mem_waste']
 
-        # RQ2 Economic Impact Metrics
+        # Economic impact
         job_df['cpu_hours_wasted'] = job_df['cpu_waste'] * job_df['ncores'] * job_df['duration_hours']
-        job_df['mem_gb_hours_wasted'] = job_df['mem_waste'] * job_df['estimated_requested_mem_gb'] * job_df['duration_hours']
+        job_df['mem_gb_hours_wasted'] = job_df['mem_waste'] * job_df['estimated_requested_mem_gb'] * job_df[
+            'duration_hours']
 
-        # RQ2 Job Type Classification
+        # Duration/size/waste categories
         job_df['duration_category'] = pd.cut(
             job_df['duration_hours'],
             bins=[0, 1, 8, 24, float('inf')],
             labels=['Short (<1h)', 'Medium (1-8h)', 'Long (8-24h)', 'Very Long (>24h)']
         )
-
-        # RQ2 Job Size Classification
         job_df['size_category'] = pd.cut(
             job_df['ncores'],
             bins=[0, 16, 64, 256, float('inf')],
             labels=['Small (1-16)', 'Medium (17-64)', 'Large (65-256)', 'Very Large (>256)']
         )
-
-        # RQ2 Severity Classification
         job_df['waste_category'] = pd.cut(
             job_df['composite_waste'],
             bins=[0, 0.25, 0.5, 0.75, 1.0],
@@ -763,11 +851,7 @@ class FrescoResourceWasteAnalyzer:
             limit_years (list): Years to analyze (for focused analysis)
             sample_jobs_fraction (float): Fraction of JOBS to sample (for testing)
             test_mode (bool): If True, limit to small subset for testing
-            hpc_system (str): Filter by HPC system. Options:
-                - 'stampede': Files containing '_S' in filename
-                - 'conte': Files containing '_C' in filename
-                - 'anvil': Files without '_S' or '_C' in filename
-                - 'all' or None: All files (no filtering)
+            hpc_system (str): 'stampede', 'conte', 'anvil', or 'all'/None
         """
         try:
             hpc_label = hpc_system or 'all'
@@ -785,9 +869,10 @@ class FrescoResourceWasteAnalyzer:
             self.job_data = self.calculate_resource_waste(self.job_data)
             stats = self.generate_statistical_summaries(self.job_data)
 
-            # Add HPC system info to stats
+            # Report selected configuration details
             stats['hpc_system'] = hpc_label
-            stats['files_processed'] = len(files)
+            # E) Successfully processed files, not just discovered
+            stats['files_processed'] = self.total_files_processed
 
             self.create_visualizations(self.job_data, stats)
             self.save_results(self.job_data, stats)
@@ -799,6 +884,7 @@ class FrescoResourceWasteAnalyzer:
         except Exception as e:
             logger.error(f"RQ2 Analysis failed for HPC system {hpc_label}: {e}", exc_info=True)
             raise
+
 
 def main():
     """
