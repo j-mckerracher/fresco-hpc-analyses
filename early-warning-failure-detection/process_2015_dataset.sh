@@ -6,6 +6,10 @@ set -e  # Exit on any error
 
 # Set up environment
 export PYTHONPATH="/home/dynamo/a/jmckerra/projects/fresco-analysis/early-warning-failure-detection:$PYTHONPATH"
+# Use Polars for telemetry time-series (faster lazy scan with pushdown)
+export FD_TELEMETRY_ENGINE=polars
+# Cap Polars internal threading for shared nodes (override by exporting POLARS_MAX_THREADS before running)
+export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-12}"
 cd /home/dynamo/a/jmckerra/projects/fresco-analysis/early-warning-failure-detection
 
 YEARS=(2015)
@@ -22,6 +26,8 @@ echo "Data root: $DATA_ROOT"
 echo "Log file: $LOG_FILE"
 echo "Working directory: $(pwd)"
 echo "Python path: $PYTHONPATH"
+echo "Telemetry engine: ${FD_TELEMETRY_ENGINE}"
+echo "Polars threads: ${POLARS_MAX_THREADS}"
 echo ""
 
 # Function to log with timestamp

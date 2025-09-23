@@ -12,6 +12,7 @@ rich>=12.0.0
 pydantic>=1.10.0
 joblib>=1.2.0
 tqdm>=4.64.0
+polars>=0.20.25
 
 # Development dependencies (optional)
 # pytest>=7.0.0

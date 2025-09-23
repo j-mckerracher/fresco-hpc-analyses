@@ -4,17 +4,20 @@ Streaming Parquet reader for FRESCO dataset.
 
 Provides memory-efficient streaming access to telemetry data with 
 job-level aggregation and intermediate caching.
+\nIncludes an optional Polars-based path for building the telemetry time-series
+with lazy scan, projection pushdown, and semi-join filtering on target JIDs.
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Union, Any
+from typing import Dict, Iterator, List, Optional, Set, Union, Any, Iterable, Sequence
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 
 import numpy as np
 import pandas as pd
+import os
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
@@ -40,6 +43,131 @@ from .utils import (
 
 
 logger = logging.getLogger(__name__)
+
+# Optional Polars availability check (import lazily when needed)
+try:
+    import polars as pl  # type: ignore
+    _HAS_POLARS = True
+except Exception:
+    _HAS_POLARS = False
+
+
+def _select_present_columns(required: Sequence[str], available: Sequence[str]) -> List[str]:
+    avail = set(available)
+    return [c for c in required if c in avail]
+
+
+def _scan_group_polars(
+    paths: List[str],
+    required_columns: List[str],
+    target_jids: Iterable[str]
+) -> Optional["pl.LazyFrame"]:
+    """Create a Polars LazyFrame for a group of parquet files with projection and JID filtering."""
+    if not _HAS_POLARS:
+        return None
+    if not paths:
+        return None
+
+    # Build a small table of target JIDs for a semi-join (better pushdown than is_in)
+    target_df = pl.DataFrame({"jid": list(target_jids)}).with_columns(
+        pl.col("jid").cast(pl.Utf8)
+    )
+
+    lf = pl.scan_parquet(paths)
+    schema = lf.schema
+    present = _select_present_columns(required_columns, list(schema.keys()))
+    if not present:
+        return None
+
+    lf = lf.select(present)
+    lf = lf.with_columns([
+        pl.col("jid").cast(pl.Utf8),
+        pl.col("time").cast(pl.Datetime("us", "UTC"), strict=False),
+    ])
+    # Filter rows to target JIDs using a semi-join (no extra columns)
+    lf = lf.join(target_df.lazy(), how="semi", on="jid")
+    # Drop rows with null time
+    lf = lf.filter(pl.col("time").is_not_null())
+    return lf
+
+
+def _concat_lazyframes_diagonal(lfs: List["pl.LazyFrame"], required_columns: List[str]) -> "pl.LazyFrame":
+    if not lfs:
+        return pl.LazyFrame()
+    lf = pl.concat(lfs, how="diagonal_relaxed")
+    # Ensure all required columns exist post-concat
+    for c in required_columns:
+        if c not in lf.columns:
+            lf = lf.with_columns(pl.lit(None).alias(c))
+    # Reorder to required_columns where available
+    lf = lf.select([c for c in required_columns if c in lf.columns])
+    return lf
+
+
+def read_telemetry_timeseries_polars(
+    file_paths: Sequence[str],
+    target_jids: Iterable[str],
+    telemetry_metrics: Dict[str, Dict],
+    batch_size: int = 1000,
+    streaming: bool = True,
+) -> pd.DataFrame:
+    """Build telemetry time-series using Polars lazy scan with pushdown and return pandas DataFrame.
+
+    Columns: ['jid', 'time'] + telemetry metric columns.
+    """
+    if not _HAS_POLARS:
+        logger.warning("Polars not available; falling back to pandas path")
+        return pd.DataFrame()
+
+    required_columns = ["jid", "time"] + list(telemetry_metrics.keys())
+
+    if not file_paths:
+        return pd.DataFrame(columns=required_columns)
+
+    # Batch files to limit open descriptors and handle schema drift
+    batches: List[List[str]] = [
+        list(file_paths[i:i + batch_size]) for i in range(0, len(file_paths), batch_size)
+    ]
+
+    group_lfs: List["pl.LazyFrame"] = []
+    for paths in batches:
+        try:
+            lf = _scan_group_polars(paths, required_columns, target_jids)
+            if lf is not None:
+                group_lfs.append(lf)
+        except Exception as e:
+            logger.exception(f"Polars scan failed for a batch of {len(paths)} files: {e}")
+            continue
+
+    if not group_lfs:
+        return pd.DataFrame(columns=required_columns)
+
+    lf_all = _concat_lazyframes_diagonal(group_lfs, required_columns)
+
+    # Minimal numeric cleaning to mirror pandas clean_numeric_column
+    clean_exprs: List["pl.Expr"] = []
+    for metric, cfg in telemetry_metrics.items():
+        if metric in lf_all.columns:
+            expr = pl.col(metric).cast(pl.Float64, strict=False)
+            vr = cfg.get("valid_range")
+            if vr:
+                lo, hi = vr
+                expr = pl.when((expr >= lo) & (expr <= hi)).then(expr).otherwise(None)
+            missing_val = cfg.get("missing_value", 0.0)
+            if missing_val is not None:
+                expr = expr.fill_null(missing_val)
+            clean_exprs.append(expr.alias(metric))
+
+    if clean_exprs:
+        lf_all = lf_all.with_columns(clean_exprs)
+
+    # Collect (streaming where possible) then return pandas for downstream compatibility
+    logger.info("Collecting telemetry with Polars (streaming=%s)", streaming)
+    df_polars = lf_all.collect(streaming=streaming, no_optimization=False)
+    pdf = df_polars.to_pandas(use_pyarrow_extension_array=False)
+    return pdf
+
+
 
 
 class ParquetStreamReader:
@@ -605,9 +733,33 @@ class DatasetBuilder:
         # Validate files
         files = self.discovery.validate_files(files)
         
-        # Process files in streaming fashion
+        # Choose engine based on config/env (default to Polars if available)
+        engine = os.getenv("FD_TELEMETRY_ENGINE", PROCESSING_CONFIG.get("telemetry_engine", "pandas")).lower()
+        file_paths = [str(f.path) for f in files]
+
+        if engine == "polars" and _HAS_POLARS:
+            logger.info(f"Telemetry reader engine: polars (files={len(file_paths)})")
+            try:
+                telemetry_df = read_telemetry_timeseries_polars(
+                    file_paths=file_paths,
+                    target_jids=target_jids or set(),
+                    telemetry_metrics=TELEMETRY_METRICS,
+                    batch_size=1000,
+                    streaming=True,
+                )
+                logger.info(f"Built telemetry dataset with {len(telemetry_df)} time-series records [engine=polars]")
+                return telemetry_df
+            except Exception as e:
+                logger.exception(f"Polars telemetry path failed: {e}. Falling back to pandas path.")
+                # Fall through to pandas path below
+        else:
+            if engine == "polars" and not _HAS_POLARS:
+                logger.warning("FD_TELEMETRY_ENGINE=polars but Polars is not installed; using pandas path")
+            else:
+                logger.info(f"Telemetry reader engine: pandas (files={len(files)})")
+
+        # Pandas fallback: Process files in streaming fashion
         dataframes = []
-        
         for df_chunk in self.reader.read_files_streaming(
             files,
             job_aggregation=False,  # Keep raw time-series
@@ -615,23 +767,28 @@ class DatasetBuilder:
         ):
             # Filter by target jids if specified
             if target_jids and 'jid' in df_chunk.columns:
-                df_chunk = df_chunk[df_chunk['jid'].astype(str).isin(target_jids)]
-            
+                # jid is normalized in _clean_telemetry_data, avoid redundant astype if already string
+                if df_chunk['jid'].dtype == object or pd.api.types.is_string_dtype(df_chunk['jid']):
+                    mask = df_chunk['jid'].isin(target_jids)
+                else:
+                    mask = df_chunk['jid'].astype(str).isin(target_jids)
+                df_chunk = df_chunk[mask]
+
             if not df_chunk.empty:
                 dataframes.append(df_chunk)
-            
+
             # Memory management
             if memory_limit_check():
                 logger.info("Combining chunks to manage memory")
                 combined = pd.concat(dataframes, ignore_index=True)
                 dataframes = [combined]
-        
+
         # Combine all chunks
         if not dataframes:
             logger.warning("No telemetry data was successfully processed")
             return pd.DataFrame()
-        
+
         telemetry_df = pd.concat(dataframes, ignore_index=True)
-        logger.info(f"Built telemetry dataset with {len(telemetry_df)} time-series records")
-        
+        logger.info(f"Built telemetry dataset with {len(telemetry_df)} time-series records [engine=pandas]")
+
         return telemetry_df

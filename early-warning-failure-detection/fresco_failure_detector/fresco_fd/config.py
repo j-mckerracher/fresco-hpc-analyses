@@ -221,6 +221,7 @@ PROCESSING_CONFIG: Dict = {
     "memory_limit_gb": 20,        # Soft memory limit
     "chunk_size_mb": 100,         # Parquet chunk size
     "progress_report_interval": 1000,  # Log progress every N jobs
+    "telemetry_engine": "polars", # Engine for telemetry reading: "polars" or "pandas"
 }
 
 # Logging configuration
