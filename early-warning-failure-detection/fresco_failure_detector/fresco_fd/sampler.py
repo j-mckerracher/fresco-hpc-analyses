@@ -18,7 +18,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 from .config import SAMPLING_CONFIG, PREDICTION_HORIZONS
 from .labeling import LabelExample, LabelGenerator
-from .features import FeatureEngineering
+from .features import OptimizedFeatureEngineering
 from .utils import ProgressTracker, save_artifact, load_artifact
 
 
@@ -60,7 +60,7 @@ class DatasetSampler:
         self.validation_split = validation_split
         self.random_state = random_state
         # self.label_generator = LabelGenerator()  # Will instantiate with correct horizons
-        self.feature_engineer = FeatureEngineering()
+        self.feature_engineer = OptimizedFeatureEngineering()
     
     def create_temporal_splits(
         self,

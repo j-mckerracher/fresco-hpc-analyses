@@ -27,7 +27,7 @@ from .utils import setup_logging, log_memory_usage
 from .io_discovery import DataDiscovery
 from .io_reader import DatasetBuilder
 from .labeling import LabelGenerator
-from .features import FeatureEngineering
+from .features import OptimizedFeatureEngineering
 from .sampler import DatasetSampler
 from .models import ModelFactory
 
@@ -339,7 +339,7 @@ def train(
             horizon_output.mkdir(exist_ok=True)
             
             # Prepare features
-            feature_eng = FeatureEngineering()
+            feature_eng = OptimizedFeatureEngineering()
             feature_eng.fit_preprocessors(split.train_features)
             
             X_train = feature_eng.transform_features(split.train_features)

@@ -207,13 +207,26 @@ EVALUATION_CONFIG: Dict = {
     "calibration_bins": 10        # Number of calibration bins
 }
 
-# File system configuration  
-# Base project directory
-DEFAULT_DATA_ROOT = "/home/dynamo/a/jmckerra/projects/fresco-analysis/data"
-PROJECT_ROOT = "/home/dynamo/a/jmckerra/projects/fresco-analysis/early-warning-failure-detection"
-CACHE_DIR = f"{PROJECT_ROOT}/artifacts/cache"
+# File system configuration
+# Base project directory - use environment variables for portability
+import os
+from pathlib import Path
 
-OUTPUT_DIR = f"{PROJECT_ROOT}/artifacts"
+# Try to detect project root from this file's location
+_CONFIG_FILE_PATH = Path(__file__).resolve()
+_DETECTED_PROJECT_ROOT = _CONFIG_FILE_PATH.parent.parent.parent
+
+# Use environment variables with fallbacks
+DEFAULT_DATA_ROOT = os.environ.get("FRESCO_DATA_ROOT",
+                                 os.environ.get("DATA_ROOT",
+                                               "/home/josh/Data/fresco_data"))
+PROJECT_ROOT = os.environ.get("FRESCO_PROJECT_ROOT",
+                             str(_DETECTED_PROJECT_ROOT))
+CACHE_DIR = os.environ.get("FRESCO_CACHE_DIR",
+                          f"{PROJECT_ROOT}/artifacts/cache")
+
+OUTPUT_DIR = os.environ.get("FRESCO_OUTPUT_DIR",
+                           f"{PROJECT_ROOT}/artifacts")
 
 # Processing configuration
 PROCESSING_CONFIG: Dict = {
